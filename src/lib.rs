@@ -1,7 +1,7 @@
 #[cfg(feature = "mmap")]
 extern crate memmap;
 
-use std::error;
+use std::{error, fs::DirEntry};
 use std::fmt;
 use std::fs;
 use std::io::prelude::*;
@@ -206,7 +206,8 @@ enum Subfolder {
 pub struct MailEntries {
     path: PathBuf,
     subfolder: Subfolder,
-    readdir: Option<fs::ReadDir>,
+    readdir: Option<Vec<Result<DirEntry, std::io::Error>>>,
+    sort_key: Option<Box<dyn Fn(&str) -> u32>>,
 }
 
 impl MailEntries {
@@ -215,6 +216,16 @@ impl MailEntries {
             path,
             subfolder,
             readdir: None,
+            sort_key: None,
+        }
+    }
+
+    fn new_sorted(path: PathBuf, subfolder: Subfolder, key: Box<dyn Fn(&str) -> u32>) -> MailEntries {
+        MailEntries {
+            path,
+            subfolder,
+            readdir: None,
+            sort_key: Some(key),
         }
     }
 }
@@ -229,15 +240,22 @@ impl Iterator for MailEntries {
                 Subfolder::New => "new",
                 Subfolder::Cur => "cur",
             });
-            self.readdir = match fs::read_dir(dir_path) {
+            let mut readdir = match fs::read_dir(dir_path) {
                 Err(_) => return None,
-                Ok(v) => Some(v),
+                Ok(v) => v.into_iter().collect::<Vec<_>>(),
             };
+            if self.sort_key.is_some() {
+                readdir.sort_unstable_by_key(|x| {
+                    x.as_ref().map(|x| (self.sort_key.as_ref().unwrap())(&x.file_name().to_string_lossy()))
+                        .unwrap_or(0)
+                });
+            }
+            self.readdir = Some(readdir);
         }
 
         loop {
             // we need to skip over files starting with a '.'
-            let dir_entry = self.readdir.iter_mut().next().unwrap().next();
+            let dir_entry = self.readdir.as_mut().map(|x| x.pop()).flatten();
             let result = dir_entry.map(|e| {
                 let entry = e?;
                 let filename = String::from(entry.file_name().to_string_lossy().deref());
@@ -355,12 +373,26 @@ impl Maildir {
         MailEntries::new(self.path.clone(), Subfolder::New)
     }
 
+    /// Returns an iterator over the messages inside the `new`
+    /// maildir folder. The sorting of messages in the iterator
+    /// is determined by the supplied key function.
+    pub fn list_new_sorted(&self, key: Box<dyn Fn(&str) -> u32>) -> MailEntries {
+        MailEntries::new_sorted(self.path.clone(), Subfolder::New, key)
+    }
+
     /// Returns an iterator over the messages inside the `cur`
     /// maildir folder. The order of messages in the iterator
     /// is not specified, and is not guaranteed to be stable
     /// over multiple invocations of this method.
     pub fn list_cur(&self) -> MailEntries {
         MailEntries::new(self.path.clone(), Subfolder::Cur)
+    }
+
+    /// Returns an iterator over the messages inside the `new`
+    /// maildir folder. The sorting of messages in the iterator
+    /// is determined by the supplied key function.
+    pub fn list_cur_sorted(&self, key: Box<dyn Fn(&str) -> u32>) -> MailEntries {
+        MailEntries::new_sorted(self.path.clone(), Subfolder::Cur, key)
     }
 
     /// Moves a message from the `new` maildir folder to the
@@ -400,14 +432,54 @@ impl Maildir {
             .map(|e| e.unwrap())
     }
 
-    fn normalize_flags(flags: &str) -> String {
+    /// Tries to find the message with the given id in the
+    /// maildir. This searches both the `new` and the `cur`
+    /// folders. Returns the path of the mail.
+    pub fn find_filename(&self, id: &str) -> Option<PathBuf> {
+        let mut path = self.path.clone();
+        path.push("new");
+        path.push(id);
+        if path.exists() {
+            return Some(path);
+        }
+        let filter = |entry: &std::io::Result<MailEntry>| match *entry {
+            Err(_) => false,
+            Ok(ref e) => e.id() == id,
+        };
+        if let Some(x) = self.list_cur()
+            .find(&filter) {
+            return Some(x.unwrap().path);
+        }
+        None
+    }
+
+    /// Tries to find the message with the given id in the
+    /// maildir. This searches both the `new` and the `cur`
+    /// folders.
+    pub fn exists(&self, id: &str) -> bool {
+        let mut path = self.path.clone();
+        path.push("new");
+        path.push(id);
+        if path.exists() {
+            return true;
+        }
+        let filter = |entry: &std::io::Result<MailEntry>| match *entry {
+            Err(_) => false,
+            Ok(ref e) => e.id() == id,
+        };
+        self.list_cur()
+            .find(&filter)
+            .is_some()
+    }
+
+    pub fn normalize_flags(flags: &str) -> String {
         let mut flag_chars = flags.chars().collect::<Vec<char>>();
         flag_chars.sort();
         flag_chars.dedup();
         flag_chars.into_iter().collect()
     }
 
-    fn update_flags<F>(&self, id: &str, flag_op: F) -> std::io::Result<()>
+    pub fn update_flags<F>(&self, id: &str, flag_op: F) -> std::io::Result<()>
     where
         F: Fn(&str) -> String,
     {
@@ -497,6 +569,32 @@ impl Maildir {
         self.store(Subfolder::New, data, "")
     }
 
+    pub fn store_new_with_id(&self, id: &str, data: &[u8]) -> std::result::Result<(), MaildirError> {
+        self.store_with_id(Subfolder::New, data, id)
+    }
+
+    pub fn store_cur_with_id(&self, id: &str, data: &[u8]) -> std::result::Result<(), MaildirError> {
+        self.store_with_id(Subfolder::Cur, data, &format!("{}:2,", id))
+    }
+
+    pub fn store_new_from_path(&self, id: &str, path: PathBuf) -> std::result::Result<(), MaildirError> {
+        let mut newpath = self.path.clone();
+        newpath.push("new");
+        newpath.push(id);
+        std::fs::hard_link(path, newpath)?;
+
+        Ok(())
+    }
+
+    pub fn store_cur_from_path(&self, id: &str, path: PathBuf) -> std::result::Result<(), MaildirError> {
+        let mut newpath = self.path.clone();
+        newpath.push("cur");
+        newpath.push(format!("{}:2,", id));
+        std::fs::hard_link(path, newpath)?;
+
+        Ok(())
+    }
+
     /// Stores the given message data as a new message file in the Maildir `cur` folder, adding the
     /// given `flags` to it. The possible flags are explained e.g. at
     /// <https://cr.yp.to/proto/maildir.html> or <http://www.courier-mta.org/maildir.html>.
@@ -571,6 +669,55 @@ impl Maildir {
         std::fs::rename(tmppath, newpath)?;
 
         Ok(id)
+    }
+
+    fn store_with_id(
+        &self,
+        subfolder: Subfolder,
+        data: &[u8],
+        id: &str,
+    ) -> std::result::Result<(), MaildirError> {
+        // try to get some uniquenes, as described at http://cr.yp.to/proto/maildir.html
+        // dovecot and courier IMAP use <timestamp>.M<usec>P<pid>.<hostname> for tmp-files and then
+        // move to <timestamp>.M<usec>P<pid>V<dev>I<ino>.<hostname>,S=<size_in_bytes> when moving
+        // to new dir. see for example http://www.courier-mta.org/maildir.html.
+        let pid = std::process::id();
+        let hostname = gethostname::gethostname();
+
+        // loop when conflicting filenames occur, as described at
+        // http://www.courier-mta.org/maildir.html
+        // this assumes that pid and hostname don't change.
+        let mut ts = time::SystemTime::now().duration_since(time::UNIX_EPOCH)?;
+        let mut tmppath = self.path.clone();
+        tmppath.push("tmp");
+        loop {
+            tmppath.push(format!(
+                "{}.M{}P{}.{}",
+                ts.as_secs(),
+                ts.subsec_nanos(),
+                pid,
+                hostname.to_string_lossy()
+            ));
+            if !tmppath.exists() {
+                break;
+            }
+            tmppath.pop();
+            ts += time::Duration::from_millis(10);
+        }
+
+        let mut file = std::fs::File::create(tmppath.to_owned())?;
+        file.write_all(data)?;
+        file.sync_all()?;
+
+        let mut newpath = self.path.clone();
+        newpath.push(match subfolder {
+            Subfolder::New => "new",
+            Subfolder::Cur => "cur",
+        });
+        newpath.push(id);
+        std::fs::rename(tmppath, newpath)?;
+
+        Ok(())
     }
 }
 
