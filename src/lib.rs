@@ -586,10 +586,10 @@ impl Maildir {
         Ok(())
     }
 
-    pub fn store_cur_from_path(&self, id: &str, path: PathBuf) -> std::result::Result<(), MaildirError> {
+    pub fn store_cur_from_path(&self, id: &str, flags: &str, path: PathBuf) -> std::result::Result<(), MaildirError> {
         let mut newpath = self.path.clone();
         newpath.push("cur");
-        newpath.push(format!("{}:2,", id));
+        newpath.push(format!("{}:2,{}", id, Self::normalize_flags(flags)));
         std::fs::hard_link(path, newpath)?;
 
         Ok(())
