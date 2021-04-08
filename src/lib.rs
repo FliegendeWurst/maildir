@@ -573,8 +573,13 @@ impl Maildir {
         self.store_with_id(Subfolder::New, data, id)
     }
 
+    #[deprecated]
     pub fn store_cur_with_id(&self, id: &str, data: &[u8]) -> std::result::Result<(), MaildirError> {
         self.store_with_id(Subfolder::Cur, data, &format!("{}:2,", id))
+    }
+
+    pub fn store_cur_with_id_flags(&self, id: &str, flags: &str, data: &[u8]) -> std::result::Result<(), MaildirError> {
+        self.store_with_id(Subfolder::Cur, data, &format!("{}:2,{}", id, flags))
     }
 
     pub fn store_new_from_path(&self, id: &str, path: PathBuf) -> std::result::Result<(), MaildirError> {
